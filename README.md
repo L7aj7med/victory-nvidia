@@ -1,128 +1,102 @@
-# VIctory on an RX 7900 XTX
+# VIctory on an RTX 5080
 
-## Run the codec_d Windows build
+A private build of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+that runs an Xbox Series title on Windows from files the user supplies. This one
+is tuned for **NVIDIA (RTX 50 series)**, built from the cool_fox fork with fixes
+merged from many other forks, plus fixes of our own.
 
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
+**This repository contains no game files, code or assets.** You need your own copy
+of the game. It is not affiliated with or endorsed by the game's developer or
+publisher.
 
-```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
-```
+## Where it stands (2026-11-26)
 
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+Tested on one machine only: Windows 11 Pro, Intel i9-12900KF, 64 GB DDR5-5600,
+**GeForce RTX 5080 (16 GB)**, driver 616.64, a 2560x1440 240 Hz monitor, game on an NVMe drive.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+| Setup | Real fps | Notes |
+|---|---|---|
+| Series S, fast (no ray tracing) | 23-28 | Stable. With NVIDIA Smooth Motion about 50 shown. Renders 1280x720, outputs 1920x1080. |
+| Series S, ray tracing | ~22 outdoors, lower indoors | Was 6-8 before the defrag shader was left out. |
+| Series X, ray tracing, 1440p output | ~12 (median 12.5) | 4K output: 7.8. Video memory nearly full. |
+| Series X, fast, 1440p output | 15-20 | Video memory full (15.9 of 16 GB): stutters, textures arrive late. |
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+Measured with scripted 8-minute runs; the title's idle camera changes the scene, so
+the figures are medians of the later minutes.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+### What is known to be wrong
 
-## Where it stands (2026-11-25)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
-
-| | |
-|---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
-
-It started at 280 ms a frame in the same scenes two days earlier.
-
-What is known to be wrong:
-
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- **Ray tracing:** blocky dark tiles in some places; indoors the screen-probe trace
+  (`CS_ScreenProbes_TraceRays`) costs up to 44 ms a frame.
+- **Series X needs more than 16 GB of video memory** with this layer (its own
+  copies add about 2.6 GB). Series X with ray tracing plus Smooth Motion runs out
+  and stalls; Series X fast mode stutters.
+- **Series X: noise on skin** (rainbow or green hands and arms) while the texture
+  queue is long (27,000 slots waiting).
+- **The GPU is busy but mostly empty:** about 95% load at only ~100 W of the
+  card's 360 W. The work reaches the card in small, serialized pieces; this is
+  where most of the missing speed is.
+- **Series S cannot go sharper:** the title refuses a 2560x1440 output and a
+  FidelityFX render scale of 1.0 on Series S (it stops on its own check at start).
+- Fast mode lights shadowed areas with a stand-in; some rooms are darker than
+  with ray tracing.
+- Turning the camera smears colour at low frame rates (temporal reprojection).
+- A cold shader cache shows garbled faces and stutters for the first minutes.
 
 ## How to run it
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+Build (Rust, Windows x64):
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+cargo build --locked --release -p victory
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+Then use the launchers in [`launcher/`](launcher). Edit the paths at the top of
+`Play-GTA.ps1` (the build, your game folder and the log folder) first.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+| Launcher | Setup |
+|---|---|
+| `Play GTA (fast).cmd` | Series S, no ray tracing: the smoothest |
+| `Play GTA (ray tracing).cmd` | Series S, ray tracing |
+| `Play GTA (fast, Series X).cmd` | Series X, no ray tracing, 2560x1440 |
+| `Play GTA (fast, Series X, sharp).cmd` | Same, rendered at native 1440p (slower) |
+| `Play GTA (ray tracing, Series X).cmd` | Series X, ray tracing, 2560x1440 |
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+`Play-GTA.ps1 -Mode fast|rt -Console series-s|series-x [-Scale 0.5-1.0] [-Output WxH]`.
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+Saves and the shader cache live in `%LOCALAPPDATA%\cool_fox`. Close the game with
+its window's close button: that saves and exits cleanly.
 
-## What is different here
+**NVIDIA App:** Smooth Motion (driver frame generation) works on
+`victory.exe` and roughly doubles the frames shown. Use it with Series S, or
+Series X fast mode; not with Series X ray tracing (out of video memory). Image
+Scaling's sharpening (30-50%) helps the soft Series S picture. DLSS cannot be
+used: the title has no DLSS, and no override tool can add it.
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+## Switches this build adds or relies on
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+| Switch | What it does |
+|---|---|
+| `VICTORY_SKIP_PIPELINES=02384a60fda6f2d0` | Leaves out `CS_DefragHeap_ComputeRelocations`, which cost ~54 ms of GPU time a frame on NVIDIA. Works in release builds. |
+| `VICTORY_PORT_CBV=1` | In-place constant buffers: -13% CPU preparation, +4.5% fps. |
+| `VICTORY_VSYNC=0-4` | Present with a sync interval; 1 stops tearing. |
+| `VICTORY_RECHECK_FRAMES=2,4,...,256`, `VICTORY_RECHECK_FOREVER=1` | Our texture fix: look at uploaded textures sooner and never stop, so stale textures are corrected fast (mid-range staleness 40 to 8 frames, ~2 fps). |
+| `VICTORY_AMBIENT_TINT=0-1` | Fast mode's stand-in light keeps the probes' brightness with our estimate's colour (no purple foliage at dusk). |
+| `VICTORY_AMBIENT=1.2` (Series X fast: 1.6) | Brightness of the stand-in light. |
+| `VICTORY_OUTPUT=WxH` | The title's output size (Series X: 2560x1440 is 60% faster than 4K). |
+| `VICTORY_RENDER_SCALE=0.5-1.0` | Series X: the title's own upscaler's render scale (2/3 by default). |
+| `VICTORY_BVH_BUILDER=1`, `VICTORY_BVH_SIZES_WAIT=1` | Ray tracing. |
 
-## Credits
+Tried and left off: the 60 fps unlock (crashes), pinning to P-cores (slower),
+refusing the FidelityFX DLL (the title divides by zero), `VICTORY_FILL_TITLE`
+and `VICTORY_PLACED_ORDER` (no measurable change in a same-run A/B).
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+## Where this build comes from
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
-
-## License
-
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+[Marvisak/VIctory](https://github.com/Marvisak/VIctory), then the cool_fox fork
+(codec_d) and VItoriaBr, with commits merged from forks by Yoshi-233,
+superboynick, oceansde012, mattkajorinc, PookiePepelsss, TaynanGT / Vice-Tay,
+dima424658, Ranxanat0r, DoubleGhosty, larpingtung and Davidjc13; ports of work by
+dng-nguyn, flipflapov and wardevsa; and part 1 of ScarlettPort pull request #25
+(ZigZagBoi1). The full list with commit ids is in the history (`a66326c1` and
+later). The previous README, from the RX 7900 XTX fork, is in the history too.
