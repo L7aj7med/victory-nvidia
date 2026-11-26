@@ -628,6 +628,16 @@ fn heap_spread() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SPREAD").is_none_or(|v| v != "0"))
 }
 
+/// Suppress a sweep's own changed-slot notifications when explicitly enabled.
+fn heap_no_requeue() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_HEAP_NO_REQUEUE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_NO_REQUEUE").is_some_and(|value| value == "1"))
+}
+
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
 #[derive(Default)]
@@ -898,7 +908,19 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
+        let scheduled = slots.len();
+        let mut next = 0;
+        // Both bitsets enumerate in slot order. A changed slot already
+        // scheduled by the periodic pass only needs one mirror lookup.
+        // Keep changed slots absent from the periodic pass, including removals.
+        for index in changed {
+            while next < scheduled && slots[next] < index {
+                next += 1;
+            }
+            if next == scheduled || slots[next] != index {
+                slots.push(index);
+            }
+        }
         slots
     } else {
         changed
@@ -909,6 +931,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
     let mut unordered = Vec::new();
+    let track_writes = crate::picked::on();
+    let avoid_requeue = heap_no_requeue();
     /// The title's heap, for the threads that look.
     struct Shared<'a>(&'a crate::descriptor::Heap);
     // SAFETY: a heap is free-threaded (its methods are called by any thread of
@@ -927,15 +951,25 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         if host.copied_tabled(index, frame) {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let handle = heap.handle(index)?;
+        let view = if avoid_requeue {
+            host.mirror_heap_buffer(index, handle)?
+        } else {
+            host.mirror(index, handle, true)?
+        };
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            if avoid_requeue {
+                host.retry_heap_buffer(index, &view);
+            }
+            return None;
+        };
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
-        let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
+        let written = track_writes && view_kind(&view) == Some(ResourceType::Uav);
         Some(((shadow, address, address + len), written))
     };
     // Some slots at a time, on several threads.
@@ -968,7 +1002,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         });
         ranges.set(index, range);
     }
-    if crate::picked::on() {
+    if track_writes {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
@@ -1457,7 +1491,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
+        // VICTORY_SKIP_PIPELINES works in release builds too (local change).
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -2829,19 +2863,20 @@ impl State {
                 && !sync_bake
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let (view, bake_key) = if sync_bake {
-                match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
+            // The view and the record it came from are read once: the upload
+            // and whatever shows the slot later refer to that record, not to
+            // one the title wrote to the slot meanwhile.
+            let (view, upload_key) = if sync_bake || shows_other || late {
+                match heap.handle(index).and_then(|handle| host.prepare_texture_slot(index, handle)) {
                     Some((view, key)) => (Some(view), Some(key)),
                     None => (None, None),
                 }
             } else {
-                let view = heap.handle(index).and_then(|handle| {
-                    if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-                });
+                let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
                 (view, None)
             };
             let at_once = || {
-                if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
+                if (late || (sync_bake && upload_key.is_some())) && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
                 }
             };
@@ -2882,7 +2917,7 @@ impl State {
             let same = !tabled && crate::texture::unchanged(resource, first);
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
-                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+                if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), upload_key, heap.handle(index)) {
                     if let Some(copy) = crate::resource::host_copy(resource) {
                         sync.keep.push(copy);
                     }
@@ -2893,8 +2928,8 @@ impl State {
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
-                        if let Some(handle) = heap.handle(index) {
-                            host.texture_slot_show_after(list, index, handle);
+                        if let (Some(handle), Some(key)) = (heap.handle(index), upload_key) {
+                            host.texture_slot_show_after(list, index, handle, key);
                         }
                     } else {
                         at_once();
@@ -2921,8 +2956,8 @@ impl State {
             if let Some(ahead) = &ahead {
                 use crate::texture::ahead::Taken;
                 let (Taken::New(job) | Taken::Known(job)) = ahead;
-                if let Some(handle) = heap.handle(index) {
-                    host.texture_slot_show_ahead(job, index, handle);
+                if let (Some(handle), Some(key)) = (heap.handle(index), upload_key) {
+                    host.texture_slot_show_ahead(job, index, handle, key);
                 }
                 if let Taken::New(job) = ahead {
                     crate::texture::ahead::send(job);
@@ -2952,17 +2987,17 @@ impl State {
                 served = false;
                 break;
             }
-            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
+            if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), upload_key, heap.handle(index)) {
                 if let Some(copy) = crate::resource::host_copy(resource) {
                     sync.keep.push(copy);
                 }
                 sync.publish.push((index, handle, key));
             }
-            if shows_other && let Some(handle) = heap.handle(index) {
-                host.texture_slot_flip(list, index, handle);
+            if shows_other && let (Some(handle), Some(key)) = (heap.handle(index), upload_key) {
+                host.texture_slot_flip(list, index, handle, key);
             }
-            if late && let Some(handle) = heap.handle(index) {
-                host.texture_slot_show_after(list, index, handle);
+            if late && let (Some(handle), Some(key)) = (heap.handle(index), upload_key) {
+                host.texture_slot_show_after(list, index, handle, key);
             }
             #[cfg(feature = "diagnostics")]
             if crate::book::on()
@@ -3087,9 +3122,9 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -4173,8 +4208,8 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }

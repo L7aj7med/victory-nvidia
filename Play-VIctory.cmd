@@ -17,7 +17,9 @@ if not exist "%runner%" (
 )
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1.5"
 if not defined VICTORY_CACHE_DIR set "VICTORY_CACHE_DIR=%LOCALAPPDATA%\VIctory\cache-pareto"
-if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=1"
+rem Wait for title memory to hold still: reading through a remap shows stale
+rem texels and makes streamed textures pop and ghost.
+if not defined VICTORY_TEXTURE_NO_WAIT set "VICTORY_TEXTURE_NO_WAIT=0"
 if not defined VICTORY_RELAY set "VICTORY_RELAY=2"
 if not defined VICTORY_WIDE_BACK set "VICTORY_WIDE_BACK=1"
 if not defined VICTORY_CARD_REHASH_RUNS set "VICTORY_CARD_REHASH_RUNS=1"
@@ -30,6 +32,9 @@ if not defined VICTORY_MAP_THREADS set "VICTORY_MAP_THREADS=1"
 if not defined VICTORY_CARD_AWAKE set "VICTORY_CARD_AWAKE=1"
 if not defined VICTORY_SHOW_AFTER set "VICTORY_SHOW_AFTER=1"
 if not defined VICTORY_AMBIENT set "VICTORY_AMBIENT=0.8"
+rem The stand-in's 12-tap depth crease shade has no real occlusion and can
+rem show through the surface in front. The light estimate stays; the AO goes.
+if not defined VICTORY_AMBIENT_SHADE set "VICTORY_AMBIENT_SHADE=0,0.6"
 if not defined VICTORY_THIN set "VICTORY_THIN=1"
 if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"

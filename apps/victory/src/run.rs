@@ -168,6 +168,29 @@ pub fn run(
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
     }
+    // The frame rate (VICTORY_FRAME_INTERVAL_MS, off without it): our frame
+    // clock ticks at that interval (victory-gpu), and the title is given
+    // the matching rate in place of its setting's 30 (VICTORY_TITLE_FPS
+    // overrides it; `off` leaves the title alone).
+    #[cfg(windows)]
+    if execute && let Some(ms) = victory_loader::frame_rate::asked_interval_ms() {
+        use victory_loader::frame_rate::{Patched, SITES, apply, title_interval_us, title_rate};
+        let asked = std::env::var("VICTORY_TITLE_FPS").ok();
+        match title_rate(ms, asked.as_deref()) {
+            Some(rate) => {
+                let size = image.info().size_of_image as usize;
+                // SAFETY: the image stays mapped and nothing of it has run yet.
+                let done = unsafe { apply(image.base(), size, rate, &SITES) };
+                let patched = done.iter().filter(|d| **d == Patched::Done).count();
+                println!(
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
+                    SITES.len(),
+                    title_interval_us(rate, false)
+                );
+            }
+            None => println!("frame rate: our clock {ms} ms; the title's own rate (30) left as it is"),
+        }
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
@@ -205,6 +228,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    timers(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
@@ -253,6 +277,46 @@ fn watch(base: usize, size: usize) {
     });
 }
 
+/// Debugging aid: `VICTORY_TIMER_LOG=1` logs the title's timers once a
+/// second (`victory_loader::frame_rate`): its frame time and limiter flag,
+/// and each timer's two times, step in seconds and in milliseconds. Whether
+/// game time keeps to the wall clock at any frame rate is read from these.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn timers(base: usize, size: usize) {
+    use victory_loader::frame_rate::{FRAME_US, LIMITER_ON, TIMERS};
+    if std::env::var("VICTORY_TIMER_LOG").ok().as_deref() != Some("1") {
+        return;
+    }
+    if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let u32_at = |rva: usize| {
+            // SAFETY: inside the mapped image (checked above), title data.
+            unsafe { ((base + rva) as *const u32).read_volatile() }
+        };
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let timers: Vec<String> = TIMERS
+                .iter()
+                .map(|&t| {
+                    let step = f32::from_bits(u32_at(t + 0xc));
+                    format!("{} {} {step:.4} {}", u32_at(t), u32_at(t + 4), u32_at(t + 0x10))
+                })
+                .collect();
+            eprintln!(
+                "VIctory: the title's timers at {} ms: frame_us {} limiter {} frames {}; timers (time ms, frames, step s, step ms): {}",
+                start.elapsed().as_millis(),
+                u32_at(FRAME_US),
+                u32_at(LIMITER_ON) & 0xff,
+                victory_hle::frames_begun(),
+                timers.join(" | ")
+            );
+        }
+    });
+}
+
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
 /// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
@@ -285,6 +349,34 @@ fn poke(base: usize, size: usize) {
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+}
+
+/// Whether `file` is a title DLL the title is told is not there when it
+/// loads it itself (`LoadLibrary` fails as for a missing file):
+/// `VICTORY_REFUSE_TITLE_DLLS=<name>,...` (any case). Port of flipflapov's
+/// e1dfc83e: the title's FidelityFX upscaler, which it loads on Series S only.
+#[cfg(windows)]
+fn refused_title_dll(file: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    static LOGGED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let names = NAMES.get_or_init(|| {
+        std::env::var("VICTORY_REFUSE_TITLE_DLLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_ascii_lowercase())
+            .filter(|name| !name.is_empty())
+            .collect()
+    });
+    let file = file.to_ascii_lowercase();
+    if !names.contains(&file) {
+        return false;
+    }
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if !logged.contains(&file) {
+        eprintln!("VIctory: a title DLL the title loads is refused (VICTORY_REFUSE_TITLE_DLLS): {file}");
+        logged.push(file);
+    }
+    true
 }
 
 /// The DLLs among `imported` (the main image's static imports) that must
@@ -331,6 +423,9 @@ impl LateDlls {
         show: impl Fn(&str, victory_loader::BindReport),
     ) -> Result<Option<usize>> {
         use victory_hle::runtime::{forget_image, image_named, set_image_path};
+        if refused_title_dll(file) {
+            return Ok(None);
+        }
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
         self.lock.hold(|| {

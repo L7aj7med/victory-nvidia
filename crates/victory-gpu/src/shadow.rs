@@ -1584,19 +1584,30 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    let threads = (wide_threads() + 1).min(n);
+    if threads <= 1 {
+        for i in 0..n {
+            work(i);
+        }
+        return;
+    }
+    // Large refresh batches mostly contain quick checks. Claim several at a
+    // time to reduce contention, keeping small batches balanced item by item.
+    let batch = if n / threads >= 16 { 4 } else { 1 };
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
-    let threads = (wide_threads() + 1).min(n);
     let jobs = (0..threads)
         .map(|_| {
             let (next, work) = (next.clone(), work.clone());
             Box::new(move || {
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
+                    let start = next.fetch_add(batch, Ordering::Relaxed);
+                    if start >= n {
                         break;
                     }
-                    work(i);
+                    for i in start..start.saturating_add(batch).min(n) {
+                        work(i);
+                    }
                 }
             }) as Job
         })
@@ -2632,8 +2643,13 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
             continue;
         }
         while let Some((&(page, _), &parts)) = pages.next_if(|((page, _), _)| page * PAGE < to) {
-            for k in (0..16).filter(|k| parts >> k & 1 != 0) {
-                let (a, b) = ((page * PAGE + k * PART).max(from), (page * PAGE + (k + 1) * PART).min(to));
+            let mut bits = u32::from(parts);
+            while bits != 0 {
+                let first = bits.trailing_zeros();
+                let end = first + (bits >> first).trailing_ones();
+                bits &= u32::MAX << end;
+                let base = page * PAGE;
+                let (a, b) = ((base + first as usize * PART).max(from), (base + end as usize * PART).min(to));
                 if a >= b {
                     continue;
                 }

@@ -83,6 +83,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod console_wave_tests;
+#[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -122,7 +124,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_BYTES, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_ADDRESSES, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -392,10 +394,40 @@ pub struct UserData {
 /// with that on for every program, 8,551 pixel programs of the title that
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
+///
+/// A program refused at a lane mask with lanes elsewhere read as data is
+/// translated once more with mask operations on numbers read as the
+/// numbers they compute (`lower::with_mask_ops_on_numbers`), and only such
+/// a program: with that on for every program, 69 compute programs that
+/// already translated came out changed (`CS_RaytracingResolve`, ...).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_inner(container)
+}
+
+thread_local! {
+    /// The container being translated may take the wave-wide form of a wave64 program on a
+    /// 32-lane host ([`with_wave_wide`]).
+    static WAVE_WIDE_FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the wave-wide form allowed for its container, as upstream
+/// VIctory does for a list of the title's programs by hash (local port of the idea of
+/// wardevsa/victory-pc-layer 95353efa: the water transmission volumetrics, which otherwise
+/// come out of approximate forms on NVIDIA).
+pub fn with_wave_wide<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = WAVE_WIDE_FORCED.replace(on);
+    let result = f();
+    WAVE_WIDE_FORCED.set(before);
+    result
+}
+
+fn translate_inner(container: &[u8]) -> Result<HostShader, ShaderError> {
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| translate_plain(container))
         }
         other => other,
     }
@@ -427,6 +459,28 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// [`emit`] with the same second tries as [`translate`] (first halves of
+/// interpolations as pairs, mask operations on numbers), for tools that
+/// run the stages themselves.
+pub fn emit_with_retries(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| emit(c, native, p, st, io, res))
+        }
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_ops_on_numbers(|| emit(c, native, p, st, io, res))
+        }
+        other => other,
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -540,15 +594,38 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
-        // Both archived kernels use one logical wave per group and have
-        // validated wave32 PSOs on RTX. Explicit policy wins.
+        // One logical wave per group, with a wave32 PSO on RTX. The particle
+        // light-atlas shaders that reset the card are not in this list.
+        // Explicit policy wins.
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
             && matches!(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    // CS_Visibility
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                    // CS_Tree_BatchCull
+                    | [0xc0, 0xf4, 0xa2, 0x3c, 0xaa, 0xa3, 0xe2, 0x34, 0xdc, 0xac, 0x7c, 0x40, 0x4c, 0x57, 0x48, 0x57]
+                    // CS_Tree_BatchCull_ImposterOnly
+                    | [0x6a, 0xc0, 0x3a, 0x0d, 0xa9, 0xb6, 0x80, 0x0d, 0xac, 0x87, 0x42, 0x32, 0x9d, 0x4f, 0x84, 0x82]
+                    // CS_TransmissionVolumetrics_Tiled
+                    | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                    // CS_TransmissionVolumetrics_Tiled_LocalLights
+                    | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                    // CS_CollisionRaytraced
+                    | [0xd3, 0x2c, 0xbc, 0xbf, 0xff, 0x6a, 0x0c, 0x04, 0x80, 0xb5, 0x06, 0xd8, 0xf7, 0xd6, 0x58, 0xf9]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option
+            .as_ref()
+            .map_or(scene_kernel || WAVE_WIDE_FORCED.get(), |v| v == "1");
+        // CS_DefragHeap_ComputeRelocations: a group of two console waves. Its
+        // divergent LDS is read and written in one region, so it only lowers
+        // once that region is taken by both halves of a wave. The other wave
+        // of the group does not wait (`with_half_meets`). Not the global switch.
+        let defrag = c.digest
+            == [
+                0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1,
+                0x23, 0xc6,
+            ];
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -578,7 +655,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on || driver_loop {
+                if wide_on || driver_loop || defrag {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -586,7 +663,11 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
+                        let again = if defrag {
+                            lower::with_half_meets(|| widen(c, native, base, why, driver_loop))
+                        } else {
+                            widen(c, native, base, why, driver_loop)
+                        };
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -633,6 +714,53 @@ pub fn emit(
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last exact resort for single-console-wave ([64, 1, 1]) programs that
+        // share LDS across a lane-branch region or need wave-wide control flow:
+        // runs only after every barrier-free form (`local_waves` included) failed,
+        // so programs like `ptfx_CS_lightAtlas_*` keep their low-barrier path.
+        if !wide_on && !driver_loop && wide_option.as_ref().is_none_or(|v| v != "0") {
+            let bases = [
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why, false);
+                report("wave-wide branches (fallback)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all (`VICTORY_WAVE_LDS_LOOSE=0` turns it off): LDS read and written inside
+        // one lane-branch region, ordered between the two host waves only where the region
+        // is entered and left (`lower::with_loose_lds`, approximate). A 32-lane host refuses
+        // the 64-lane form outright, which drops every dispatch of the program.
+        let loose_on = std::env::var_os("VICTORY_WAVE_LDS_LOOSE").is_none_or(|v| v != "0");
+        if loose_on && !strict {
+            let bases = [forms[0].1.as_ref(), forms[1].1.as_ref()];
+            for (name, f) in [("without early-outs", bases[0]), ("without skips", bases[1])] {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("loose LDS (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("loose LDS (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res)));
+                report("loose LDS + local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
@@ -705,6 +833,9 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // One program only: two console waves, and a meet per wave instead of a group barrier.
+        crate::native::StageIo::Cs(cs)
+            if lower::half_meets() && cs.threads.iter().product::<u32>() == 128 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -881,7 +1012,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })
@@ -1472,10 +1603,8 @@ mod tests {
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
 
         let sampler = StaticSampler::from_words([0; 4]);
-        let comparison = StaticSampler {
-            filter: sampler.filter | 0x80,
-            ..sampler
-        };
+        let mut comparison = sampler;
+        comparison.make_comparison();
         assert_eq!(out.samplers, [[0; 4]; 2]);
         assert_eq!(out.static_samplers, [sampler, comparison]);
         #[cfg(windows)]

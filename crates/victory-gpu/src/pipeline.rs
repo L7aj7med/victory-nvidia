@@ -471,7 +471,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -491,7 +491,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -507,7 +507,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -706,7 +706,7 @@ pub(crate) extern "system" fn create_stream(
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
     let mut at = 0;
-    while at + 8 <= desc.size {
+    while desc.size - at >= 8 {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
@@ -717,10 +717,15 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(kind, at, "truncated pipeline subobject; the rest is ignored");
+            break;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: the whole shader subobject is in the stream. Its
+            // bytecode starts at +8 and may be unaligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -854,6 +859,37 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[test]
+    fn streams_read_unaligned_shaders_and_skip_truncated_subobjects() {
+        let shader = [1u8, 2, 3, 4];
+        let mut backing = [0u64; 4];
+        // SAFETY: the 32 bytes of backing hold the 24-byte stream at offset 1.
+        let stream = unsafe {
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 24)
+        };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes());
+        stream[8..16].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+        stream[16..24].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+
+        for size in [24, 23] {
+            let desc = StreamDesc {
+                size,
+                stream: stream.as_ptr(),
+            };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            if size == 24 {
+                assert_eq!(shaders(p), [("vertex", shader.to_vec())]);
+            } else {
+                assert!(shaders(p).is_empty());
+            }
+            assert_eq!(release(p), 0);
+        }
     }
 
     /// The stream layout the title builds (title+0x86f090): root

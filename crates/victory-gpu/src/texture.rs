@@ -112,6 +112,19 @@ struct Last {
     hot_until: u64,
 }
 
+impl Last {
+    /// A sparse read can consist entirely of zero-filled holes. Keep the
+    /// digest of the texels actually staged until a usable read replaces them.
+    fn accept_partial(&mut self, bytes: &[u8]) -> bool {
+        let hash = digest(bytes);
+        if self.hash == Some(hash) || bytes.iter().all(|&b| b == 0) {
+            return false;
+        }
+        self.hash = Some(hash);
+        true
+    }
+}
+
 /// Frames a guarded texture is hashed at every check from its first check,
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
@@ -1362,12 +1375,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = digest(read);
-                if last.hash == Some(hash) {
-                    return false;
-                }
-                last.hash = Some(hash);
-                if read.iter().all(|&b| b == 0) {
+                if !last.accept_partial(read) {
                     return false;
                 }
                 self.detile(read);
@@ -1947,6 +1955,22 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {
+        use super::{Last, digest};
+        let mut last = Last::default();
+        let missing = [0; 128];
+        let visible = [0x7a; 128];
+
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, None, "an empty first read must remain eligible for another upload");
+        assert!(last.accept_partial(&visible));
+        assert!(!last.accept_partial(&missing));
+        assert_eq!(last.hash, Some(digest(&visible)));
+        assert_ne!(last.hash, Some(digest(&missing)), "a later complete zero texture still needs detiling");
+        assert!(!last.accept_partial(&visible));
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does

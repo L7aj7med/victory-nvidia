@@ -85,6 +85,9 @@ impl Journal {
 /// the asking it took the page at): the parts to take again, a bit for each
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
     let j = journal();
     pages.iter().map(|&(page, taken)| j.parts_since(page, taken)).collect()
 }
@@ -313,12 +316,18 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // Repeated flushes use the submission's existing asking. Check before
+    // scanning and sorting ranges that would be discarded.
+    if ranges.len() < 2 || journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
         .filter(|r| r.0 < r.1 && !published(r.0, r.1))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !light() || !PROTECTED.any(first, last))
         .collect();
     if pieces.len() < 2 {
         return;
@@ -555,7 +564,10 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        // Leave guarded view memory to writes(), which can report changes
+        // using the guard journal even when the kernel cannot watch it.
+        if !(light() && PROTECTED.any(first, last))
+            && !ahead.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
@@ -752,8 +764,15 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
+    // Local hardening: a page the range should not hold (seen once as
+    // first - 4095, three threads at once, in a 24-minute session) answers
+    // "something new", so the caller asks again instead of panicking.
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+        && j.written.range(first..last).all(|(&page, &write)| {
+            page.checked_sub(first)
+                .and_then(|i| taken.get(i))
+                .is_some_and(|&at| write <= at.max(ranged))
+        })
 }
 
 impl Tracked {

@@ -243,8 +243,14 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // Next to a very bright lamp the title's value can be infinite: then
+    // `cap / has` is 0 and inf * 0 is NaN, written back into the volume and
+    // drawn black or as a stray colour (purple, pink) where it was brightest.
+    // NaN counts as nothing, infinity as the most a half float holds.
+    c = any(isnan(c)) ? 0.0 : min(max(c, 0.0), 65504.0);
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
+    else if (any(isnan(scattered[at])) || any(isinf(scattered[at]))) scattered[at] = c;
 }
 #endif
 
@@ -285,7 +291,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
         for (int i = 0; i < N; i++) {
             float a = i * 2.399963 + noise * 6.2831853;
             float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
-            float3 v = seen(p + int2(round(o)), size) - c;
+            float3 s = seen(p + int2(round(o)), size);
+            // A neighbour much nearer or much farther is another surface
+            // seen across a silhouette, not a crease in this one. Counting it
+            // darkens the surface in front with the one behind it, which is
+            // how the crease shade came to show through things.
+            if (s.z < c.z * 0.8 || s.z > c.z * 1.25 + 0.05) continue;
+            float3 v = s - c;
             float vv = dot(v, v);
             float over = dot(v, n) - 0.004 * c.z - 0.005;
             sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
@@ -321,6 +333,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
+    // Magenta (green far below red and blue) is what the probes' memory held, not light.
+    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);

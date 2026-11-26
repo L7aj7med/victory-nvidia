@@ -663,10 +663,27 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
         // SAFETY: a buffer of the size the library asks for.
         return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
     }
-    let mut bytes = vec![0u8; size];
+    // Reserved fallibly (Marvisak #2007): on NVIDIA the library is gigabytes
+    // and an infallible `vec!` aborted the process when the commit was full.
+    // Refused, the save is left for later (the pipelines stay added).
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::OutOfMemory, format!("no memory for {size} bytes of the library; saved later"))
+    })?;
+    bytes.resize(size, 0);
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
     std::fs::write(tmp, &bytes)
+}
+
+/// Allocates the fallback buffer without aborting if the host is low on memory.
+fn save_buffer(size: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+    bytes.resize(size, 0);
+    Ok(bytes)
 }
 
 /// Renames the written library `tmp` over the library's file in `dir`. This
@@ -783,6 +800,13 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_buffer_reports_allocation_failure() {
+        let error = save_buffer(usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert_eq!(save_buffer(100).unwrap(), [0; 100]);
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

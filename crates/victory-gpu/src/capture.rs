@@ -630,7 +630,19 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Texels holding an infinity or no number (local diagnostic): how many,
+    // and the box they lie in.
+    let (mut nan, mut inf, mut bx) = (0usize, 0usize, (usize::MAX, usize::MAX, 0usize, 0usize));
+    for (k, v) in values.iter().enumerate() {
+        let (isnan, isinf) = (v.iter().any(|c| c.is_nan()), v.iter().any(|c| c.is_infinite()));
+        if isnan || isinf {
+            nan += usize::from(isnan);
+            inf += usize::from(isinf && !isnan);
+            let (x, y) = (k % w.max(1), k / w.max(1));
+            bx = (bx.0.min(x), bx.1.min(y), bx.2.max(x), bx.3.max(y));
+        }
+    }
+    tracing::info!(format, low, high, nonzero_percent, nan, inf, nonfinite_box = ?bx, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.

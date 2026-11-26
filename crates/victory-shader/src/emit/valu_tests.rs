@@ -47,6 +47,14 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     vop3_mod(op, vdst, src0, src1, src2, 0, 0, 0, false)
 }
 
+/// VOP3P `op vdst, src0, src1, src2` (default opsel_hi: high halves for second element).
+const fn vop3p(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32 & 0x7F) << 16 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | (src2 as u32 & 0x1FF) << 18 | (3 << 27),
+    ]
+}
+
 /// VOP3 `op vdst, src0, src1, src2` with explicit `abs`, `neg`, `omod`, `clamp`.
 #[allow(clippy::too_many_arguments)]
 const fn vop3_mod(
@@ -2013,7 +2021,7 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
     let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
     let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
-    let bodies: [(&str, Vec<u32>, bool); 14] = [
+    let bodies: [(&str, Vec<u32>, bool); 13] = [
         ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
         ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
         ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
@@ -2026,7 +2034,6 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
         ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
         ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
-        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
         ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
     ];
     let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
@@ -2389,5 +2396,237 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
                 .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
             assert_eq!(out[0], want, "{backend} {label}: buffer_load_format_x mismatch");
         }
+    }
+}
+
+#[test]
+fn packed_dot_products_and_clamps_execute_cleanly() {
+    let [iw0, iw1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_i8_shader = build_valu_cs(&[iw0, iw1]);
+    let inputs = [[0x0403_0201u32, 0x0504_0302u32, 10u32, 0]];
+    run_cases(&dot4_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_i32_i8 got {got}, want 50");
+    });
+
+    // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
+    let d4c_copy = vop1(0x001, 0, vgpr(3));
+    let d4c = (0x0Du32 << 25) | (2u32 << 9) | (vgpr(1) as u32);
+    let dot4c_i8_shader = build_valu_cs(&[d4c_copy, d4c]);
+    run_cases(&dot4c_i8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4c_i32_i8 got {got}, want 50");
+    });
+
+    let [uw0, uw1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot4_u8_shader = build_valu_cs(&[uw0, uw1]);
+    run_cases(&dot4_u8_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 50, "{backend}: v_dot4_u32_u8 got {got}, want 50");
+    });
+
+    // opsel_hi / opsel swapping the halves of s0 on v_dot4_u32_u8 (opsel=0b001, opsel_hi=0b110)
+    let mut u8_op = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    u8_op[0] |= 1 << 11;
+    u8_op[1] = (u8_op[1] & !(3 << 27)) | (2 << 27);
+    let dot4_u8_opsel_shader = build_valu_cs(&u8_op);
+    run_cases(&dot4_u8_opsel_shader, &inputs, |backend, _i, _inp, got| {
+        assert_eq!(got, 42, "{backend}: v_dot4_u32_u8 opsel got {got}, want 42");
+    });
+
+    let [d2i_w0, d2i_w1] = vop3p(0x014, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_i16_shader = build_valu_cs(&[d2i_w0, d2i_w1]);
+    run_cases(
+        &dot2_i16_shader,
+        &[[0x0003_FFFEu32, 0xFFFB_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFF3, "{backend}: v_dot2_i32_i16 got {got:#x}");
+        },
+    );
+
+    let [d2u_w0, d2u_w1] = vop3p(0x015, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot2_u16_shader = build_valu_cs(&[d2u_w0, d2u_w1]);
+    run_cases(
+        &dot2_u16_shader,
+        &[[0x0003_0002u32, 0x0005_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 33, "{backend}: v_dot2_u32_u16 got {got}, want 33");
+        },
+    );
+
+    let [d8u_w0, d8u_w1] = vop3p(0x019, 0, vgpr(1), vgpr(2), vgpr(3));
+    let dot8_u4_shader = build_valu_cs(&[d8u_w0, d8u_w1]);
+    run_cases(
+        &dot8_u4_shader,
+        &[[0x1111_1111u32, 0x2222_2222u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 26, "{backend}: v_dot8_u32_u4 got {got}, want 26");
+        },
+    );
+
+    let [mut d2f_w0, d2f_w1] = vop3p(0x013, 0, vgpr(1), vgpr(2), vgpr(3));
+    let d2f_in = [[0x4000_3C00u32, 0x4400_4200u32, 5.0f32.to_bits(), 0]];
+    let dot2_f16_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2_f32_f16 got {got:#x}");
+    });
+    d2f_w0 |= 1 << 15;
+    let dot2_f16_clamp_shader = build_valu_cs(&[d2f_w0, d2f_w1]);
+    run_cases(&dot2_f16_clamp_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 1.0f32.to_bits(), "{backend}: v_dot2_f32_f16 clamp got {got:#x}");
+    });
+
+    // VOP2 v_dot2c_f32_f16 v3, v1, v2 (opcode 0x02): 1.0*3.0 + 2.0*4.0 + 5.0 = 16.0
+    let d2c = (0x02u32 << 25) | (3u32 << 17) | ((2u32) << 9) | (vgpr(1) as u32);
+    let copy_v3_v0 = vop1(0x001, 0, vgpr(3));
+    let dot2c_f16_shader = build_valu_cs(&[d2c, copy_v3_v0]);
+    run_cases(&dot2c_f16_shader, &d2f_in, |backend, _i, _inp, got| {
+        assert_eq!(got, 16.0f32.to_bits(), "{backend}: v_dot2c_f32_f16 got {got:#x}");
+    });
+
+    // Clamped integer dot products saturate instead of wrapping.
+    let [mut cu_w0, cu_w1] = vop3p(0x017, 0, vgpr(1), vgpr(2), vgpr(3));
+    cu_w0 |= 1 << 15;
+    let clamp_u8_shader = build_valu_cs(&[cu_w0, cu_w1]);
+    run_cases(
+        &clamp_u8_shader,
+        &[[0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFF0u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 0xFFFF_FFFFu32, "{backend}: v_dot4_u32_u8 clamp got {got:#x}");
+        },
+    );
+
+    let [mut ci_w0, ci_w1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
+    ci_w0 |= 1 << 15;
+    let clamp_i8_shader = build_valu_cs(&[ci_w0, ci_w1]);
+    let ci_in = [
+        [0x7F7F_7F7Fu32, 0x7F7F_7F7Fu32, 0x7FFF_FFF0u32, 0],
+        [0x7F7F_7F7Fu32, 0xFFFF_FFFFu32, 0x8000_0010u32, 0],
+    ];
+    run_cases(&clamp_i8_shader, &ci_in, |backend, i, _inp, got| {
+        let want = if i == 0 { 0x7FFF_FFFFu32 } else { 0x8000_0000u32 };
+        assert_eq!(got, want, "{backend}: v_dot4_i32_i8 clamp case {i} got {got:#x}");
+    });
+
+    // v_dot2_u32_u16 with opsel picking high half of v1 for pair 0 (opsel[0] = 1, opsel_hi[0] = 0).
+    let mut u16_op = vop3p(0x015, 0, vgpr(1), vgpr(2), vgpr(3));
+    u16_op[0] |= 1 << 11;
+    u16_op[1] &= !(1 << 27);
+    let opsel_u16_shader = build_valu_cs(&u16_op);
+    run_cases(
+        &opsel_u16_shader,
+        &[[0x0003_0002u32, 0x0005_0004u32, 10u32, 0]],
+        |backend, _i, _inp, got| {
+            assert_eq!(got, 32, "{backend}: v_dot2_u32_u16 opsel got {got}, want 32");
+        },
+    );
+}
+
+#[test]
+fn v_mul_legacy_f32_treats_denormals_as_zero() {
+    // v_mul_legacy_f32 v0, v1, v2 (VOP2 opcode 0x007 in its VOP3 encoding)
+    let shader = build_valu_cs(&vop3(0x107, 0, vgpr(1), vgpr(2), vgpr(0)));
+    let f = f32::to_bits;
+    let (denorm, neg_denorm, min_normal) = (0x0000_0001u32, 0x8040_0000u32, 0x0080_0000u32);
+
+    let cases: &[(u32, u32, u32)] = &[
+        // Zero or denormal times anything, non-finite included, is +0.
+        (f(0.0), f(f32::INFINITY), f(0.0)),
+        (f(-0.0), f(f32::NAN), f(0.0)),
+        (f(f32::NAN), f(0.0), f(0.0)),
+        (denorm, f(f32::INFINITY), f(0.0)),
+        (f(f32::NAN), neg_denorm, f(0.0)),
+        (denorm, f(2.0f32.powi(100)), f(0.0)),
+        // The smallest normal is not zero.
+        (min_normal, f(2.0), f(f32::MIN_POSITIVE * 2.0)),
+        // Ordinary products.
+        (f(1.5), f(-4.0), f(-6.0)),
+        (f(3.0), f(0.5), f(1.5)),
+    ];
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: v_mul_legacy_f32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+/// `v_mad_legacy_f32` and `v_mac_legacy_f32` as RDNA 2 runs them (fork PR #1026): fused,
+/// as `v_fma_legacy_f32` and `v_fmac_legacy_f32`, with subnormal sources flushed and the
+/// legacy rule that a zero factor makes the product +0.
+#[test]
+fn legacy_multiply_adds_fuse_their_product_and_flush_their_sources() {
+    let mad = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
+    // v_mac_legacy_f32 v3, v1, v2; v_mov_b32 v0, v3
+    let mac = build_valu_cs(&[vop2(0x06, 3, vgpr(1), 2), vop1(0x001, 0, vgpr(3))]);
+    let cases = [
+        // (1 + 2^-23) * (1 - 2^-23) - 1 is -2^-46 exactly: kept by one rounding,
+        // lost when the product is rounded before the add.
+        [0x3f80_0001, 0x3f7f_fffe, 0xbf80_0000, 0],
+        // A subnormal source flushes to zero: subnormal * 1.0 + 0.0 == 0.0.
+        [0x0000_0001, 0x3f80_0000, 0x0000_0000, 0],
+        // A flushed subnormal factor is a zero factor, even against +inf.
+        [0x0000_0001, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor gives a +0 product even with an infinite factor.
+        [0, 0x7f80_0000, 0x3f80_0000, 0],
+        // A zero factor's product is +0 whatever the other factor's sign: +0 + -0 is +0.
+        [0, 0xbf80_0000, 0x8000_0000, 0],
+    ];
+    let want = [0xa880_0000u32, 0x0000_0000, 0x3f80_0000, 0x3f80_0000, 0x0000_0000];
+    for (name, shader) in [("v_mad_legacy_f32", &mad), ("v_mac_legacy_f32", &mac)] {
+        run_cases(shader, &cases, |backend, i, _, got| {
+            if backend == "warp" && i == 0 {
+                // WARP rounds the product before the add; the hardware's single
+                // rounding is the reference for the fused form.
+                eprintln!("{backend}: fused rounding differs on WARP; skipped");
+                return;
+            }
+            assert_eq!(got, want[i], "{backend}: {name} case {i}");
+        });
+    }
+}
+
+/// `v_fmac_f32` in the VOP3 encoding takes `neg[2]` (`-acc`) and `abs[2]` (`|acc|`) on its
+/// accumulator, the destination register (upstream #3158). The rows are measured on RDNA2
+/// (gfx1031, IEEE mode off, f32 denormals flushed) as published by the AnyPS5 project
+/// (`VFmacF32AccumulatorModifiers.cpp`, 85129d854d); a NaN is compared as any NaN, as hosts
+/// give NaNs bits of their own.
+#[test]
+fn v_fmac_f32_takes_the_accumulator_modifiers() {
+    // ([a, b, acc], with neg[2], with abs[2])
+    const ROWS: [([u32; 3], u32, u32); 16] = [
+        ([0x3F80_0000, 0x4000_0000, 0x3F80_0000], 0x3F80_0000, 0x4040_0000),
+        ([0x3F80_0000, 0x4000_0000, 0xBF80_0000], 0x4040_0000, 0x4040_0000),
+        ([0x4000_0000, 0x4040_0000, 0xC0C0_0000], 0x4140_0000, 0x4140_0000),
+        ([0x4000_0000, 0xC040_0000, 0xC0C0_0000], 0x0000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x0000_0000], 0x8000_0000, 0x0000_0000),
+        ([0x0000_0000, 0xBF80_0000, 0x8000_0000], 0x0000_0000, 0x0000_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7F80_0000], 0xFF80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x7F80_0000, 0x3F80_0000, 0xFF80_0000], 0x7F80_0000, 0x7F80_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x7FC0_0001], 0xFFC0_0001, 0x7FC0_0001),
+        ([0x3F80_0000, 0x3F80_0000, 0xFFA0_0000], 0x7FA0_0000, 0x7FA0_0000),
+        ([0x3F80_0000, 0x3F80_0000, 0x0000_0001], 0x3F80_0000, 0x3F80_0000),
+        ([0x0080_0000, 0x3F80_0000, 0x8080_0001], 0x0100_0000, 0x0100_0000),
+        ([0x4040_0000, 0x3EAA_AAAB, 0xBF80_0000], 0x4000_0000, 0x4000_0000),
+        ([0x7F7F_FFFF, 0x4000_0000, 0xFF7F_FFFF], 0x7F80_0000, 0x7F80_0000),
+        ([0xBF80_0000, 0x4000_0000, 0x4000_0000], 0xC080_0000, 0x0000_0000),
+    ];
+    let nan = |x: u32| x & 0x7FFF_FFFF > 0x7F80_0000;
+    let cases: Vec<[u32; 4]> = ROWS.iter().map(|&([a, b, acc], _, _)| [a, b, acc, 0]).collect();
+    for (label, abs, neg) in [("neg[2]", 0, 4), ("abs[2]", 4, 0)] {
+        // v_mov_b32 v5, v3; v_fmac_f32 v5, v1, v2 (VOP3, the modifier on src2); v_mov_b32 v0, v5
+        let mut body = vec![vop1(0x001, 5, vgpr(3))];
+        body.extend(vop3_mod(0x12B, 5, vgpr(1), vgpr(2), 0, abs, neg, 0, false));
+        body.push(vop1(0x001, 0, vgpr(5)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let want = if neg != 0 { ROWS[i].1 } else { ROWS[i].2 };
+            assert!(
+                got == want || nan(got) && nan(want),
+                "{backend}: {label} row {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
     }
 }
