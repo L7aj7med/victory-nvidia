@@ -97,7 +97,21 @@ fn scene_input(shaders: &[Arc<Shader>]) -> bool {
                 | "2cc4c197ee29e291"
                 | "369cbe906ea72764"
         ) || crate::draw::BAKE_PIXEL_SHADERS.contains(&s.hash.as_str())
+            // (Port of ScarlettPort PR #25.) Passes the title runs once, whose output
+            // stays empty for the rest of the run if they are dropped while their
+            // pipeline compiles: the six draws that build the environment BRDF,
+            // area-light and scattering tables (one vertex program), and the
+            // decoration bakes of characters' heads and their block compression,
+            // found by name so that every permutation counts.
+            || (s.stage == "vertex" && s.hash == "ce57291b5a1750ca")
+            || runs_once_by_name(s)
     })
+}
+
+/// Whether `s` is one of the title's run-once bake programs, by the name in its container.
+fn runs_once_by_name(s: &Shader) -> bool {
+    const NAMES: [&[u8]; 3] = [b"BakeDecorations", b"DecorationBlend", b"CS_CompressBC"];
+    NAMES.iter().any(|name| s.container.windows(name.len()).any(|w| w == *name))
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
