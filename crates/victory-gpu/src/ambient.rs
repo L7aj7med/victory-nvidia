@@ -112,6 +112,16 @@ fn air() -> f32 {
     })
 }
 
+/// How much of the probes' leftover colour is replaced by the estimate's
+/// (`VICTORY_AMBIENT_TINT=<0..1>`, local change; unset or 0: as before).
+fn tint() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_TINT").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite()).map_or(0.0, |v: f32| v.clamp(0.0, 1.0))
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -137,7 +147,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float tint;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -335,6 +345,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 was = unpack(light[p]);
     // Magenta (green far below red and blue) is what the probes' memory held, not light.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+    // (Local, `VICTORY_AMBIENT_TINT`.) The probes' memory, refreshed by nothing
+    // without rays, keeps stale colours in blocks of tiles (blue-purple ones pass
+    // the magenta test): keep its brightness, take the colour of the estimate.
+    float was_l = dot(was, LUMA);
+    float3 recoloured = found * (was_l / max(dot(found, LUMA), 1e-6));
+    was = lerp(was, recoloured, tint);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
     float top = max(dot(found, LUMA) * most, 1e-6);
@@ -475,6 +491,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = tint().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
