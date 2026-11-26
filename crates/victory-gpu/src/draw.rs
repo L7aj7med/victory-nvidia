@@ -208,7 +208,7 @@ fn recheck_soon() -> bool {
 
 /// Frames ahead the pass before a bake takes slots from that are due only
 /// then ([`bake_exact`]): those of notices (1 and 2), and the first looks
-/// again ([`RECHECK_FRAMES`]), these at the frame's first bake alone (a
+/// again ([`recheck_frames`]), these at the frame's first bake alone (a
 /// look reads 48 KiB, and a frame bakes up to sixteen times).
 const BAKE_AHEAD: [u64; 2] = [12, 2];
 
@@ -763,7 +763,30 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
-const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+const RECHECK_FRAMES_DEFAULT: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// [`RECHECK_FRAMES_DEFAULT`], or `VICTORY_RECHECK_FRAMES=<n>,<n>,...` (local change):
+/// the title often refills or reuses a texture's memory long after its upload
+/// (session logs: changes found at every look, 38 of them only at the last one,
+/// 576 frames in), and the old picture shows until the next look finds it.
+fn recheck_frames() -> &'static [u64] {
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_RECHECK_FRAMES")
+            .ok()
+            .map(|v| v.split(',').filter_map(|n| n.trim().parse::<u64>().ok()).filter(|&n| n > 0).collect::<Vec<_>>())
+            .filter(|v| !v.is_empty() && v.len() < 255)
+            .unwrap_or_else(|| RECHECK_FRAMES_DEFAULT.to_vec())
+    })
+}
+
+/// `VICTORY_RECHECK_FOREVER=1` (local change): after the last look of
+/// [`recheck_frames`], keep looking at that interval for the rest of the run
+/// instead of taking the texture as settled.
+fn recheck_forever() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_FOREVER").is_some_and(|v| v == "1"))
+}
 
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
@@ -2713,7 +2736,7 @@ impl State {
             // page alone, one whose first page is the one missing counted
             // as not there.)
             // A slot uploaded whole is looked at again a few times
-            // (`RECHECK_FRAMES`): the title writes a texture's view, and
+            // (`recheck_frames`): the title writes a texture's view, and
             // may fill the texture's memory itself only afterwards, with
             // no descriptor write and nothing from the runtime to tell of
             // it. The host copy then kept what the memory held at the
@@ -2725,13 +2748,19 @@ impl State {
             // title paints all the time through another view of their pages
             // (all their blocks are shown at other addresses too), and each
             // was shown four frames late, over and over.
-            let mut again_in = RECHECK_FRAMES[0];
+            let mut again_in = recheck_frames()[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                    let frames = recheck_frames();
+                    let next = frames.get(usize::from(looks) + 1).copied().or_else(|| {
+                        // Past the schedule: the last interval again, the count held.
+                        recheck_forever().then(|| *frames.last().unwrap_or(&400))
+                    });
+                    match next {
                         Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                            let looks = (looks + 1).min(frames.len().saturating_sub(1) as u8);
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks, uploaded)
                         }
                         None => host.texture_slot_done(index, write, None),
                     }
