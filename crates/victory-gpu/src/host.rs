@@ -9443,7 +9443,14 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // `VICTORY_VSYNC=<n>` (1-4): wait for that many vertical blanks before the
+            // frame shows, so a full-screen window does not tear (local change; 0 or
+            // unset: show at once, as before).
+            static SYNC: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let sync = *SYNC.get_or_init(|| {
+                std::env::var("VICTORY_VSYNC").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(4)
+            });
+            let _ = p.swap_chain.Present(sync, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
